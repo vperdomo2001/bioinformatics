@@ -1,2 +1,4 @@
 # bioinformatics
-space for bioinformatics code and projects
+a space for bioinformatics code and projects
+
+rbif 112 - mathematical modeling for bioinformatics
