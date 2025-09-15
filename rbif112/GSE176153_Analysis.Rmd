@@ -1,0 +1,284 @@
+---
+title: GSE176153 Analysis
+author: "Author: Veronica Perdomo"
+date: "Last update: `r format(Sys.time(), '%d %B, %Y')`" 
+output:
+  html_document: 
+    toc: true
+    toc_float: true
+    toc_depth: 4
+    fig_caption: true
+    code_folding: hide
+    number_sections: true
+  pdf_document:
+    toc: true
+vignette: >
+    %\VignetteIndexEntry{Text}
+    %\usepackage[utf8]{inputenc}
+    %\VignetteEngine{knitr::rmarkdown}
+fontsize: 15pt
+editor_options: 
+  chunk_output_type: console
+---
+
+<style>
+pre code, pre, code {
+  white-space: pre !important;
+  overflow-x: auto !important;
+  word-break: keep-all !important;
+  word-wrap: initial !important;
+}
+body {
+text-align: justify}
+</style>
+
+
+**Downloaded a data set from GEO** 
+
+```{r 2-setup, eval=TRUE, echo=TRUE, message=FALSE, warning=FALSE}
+#  GEODataDownload function 
+GEODataDownload <- function(DS, gpl, gsm, PlateAnnotInfo, GenerateMetaData, Technology){
+  library(DESeq2); library(limma); library(data.table)
+  if(Technology == "Array"){
+    gset <- getGEO(DS)
+    if(length(gset) > 1) idx <- grep(gpl, attr(gset, "names")) else idx <- 1
+    gset <- gset[[idx]]
+    fvarLabels(gset) <- make.names(fvarLabels(gset))
+    comp <- gsub(" ", "", gsm)
+    comp <- gsub(",", "", comp)
+    gsms <- paste0(comp)
+    #### Set up raw names ####
+    sml <- c()
+    for(i in 1:nchar(gsms)){ sml[i] <- substr(gsms,i,i)}
+    ex <- exprs(gset)
+    qx <- as.numeric(quantile(ex, c(0., 0.25, 0.5, 0.75, 0.99, 1.0), na.rm=T))
+    LogC <- (qx[5] > 100) ||
+      (qx[6]-qx[1] > 50 && qx[2] > 0) ||
+      (qx[2] > 0 && qx[2] < 1 && qx[4] < 2)
+    if(LogC){ ex[which(ex <= 0)] <- NaN
+    exprs(gset) <- log2(ex) }
+    sml <- paste("G", sml, sep="")
+    f1 <- as.factor(sml)
+    gset$description2 <- f1
+    design <- model.matrix(~description2 + 0, gset)
+    colnames(design) <- levels(f1)
+    fit <- lmFit(gset, design)
+    cont.matrix <- makeContrasts(G1-G0, levels = design)
+    fit2 <- contrasts.fit(fit, cont.matrix)
+    fit2 <- eBayes(fit2, 0.01)
+    tT <- topTable(fit2, adjust="fdr", sort.by = "B", number = 25000000000)
+    #### subset ####
+    ex2 <- data.table(subset(tT, select=c("ID", "logFC", "P.Value", "adj.P.Val")))
+    ex2$ID <- as.character(ex2$ID)
+    #### annotate with gene names ####
+    plat <- PlateAnnotInfo[GPLID == gpl,][,!"GPLID", with = FALSE]
+    if(nrow(plat) == 0){ print(paste("There is no annotation information available for", gpl)) }
+    plat$ID <- as.character(plat$ID)
+    plat <- plat[!duplicated(plat$ID),]
+    ex2 <- merge(plat, ex2, by = "ID")
+    ex2$ID <- as.character(ex2$ID)
+    exraw <- data.table(ex)
+    exraw$ID <- as.character(rownames(ex))
+    #### annotate raw data with gene names ####
+    ex2 <- merge(ex2, exraw, by = "ID")
+    #### Generate Meta Data ####
+    Pdat <- pData(gset)
+    #### Add Meta data ####
+    Pdat <- as.data.table(Pdat)
+    return(list(Data = ex2, MetaData = Pdat))
+  }
+  
+  if(Technology == "RNAseq"){
+    ACC <- paste("acc=", DS, sep = "")
+    file <- paste("file=", DS, "_raw_counts_GRCh38.p13_NCBI.tsv.gz", sep = "")
+    comp <- gsub(" ", "", gsm)
+    comp <- gsub(",", "", comp)
+    gsms <- paste0(comp)
+    #### Set up DEG names ####
+    urld <- "https://www.ncbi.nlm.nih.gov/geo/download/?format=file&type=rnaseq_counts"
+    path <- paste(urld, ACC, file, sep="&");
+    tbl <- as.matrix(data.table::fread(path, header=T, colClasses="integer"), rownames="GeneID")
+    exraw <- tbl 
+    apath <- paste(urld, "type=rnaseq_counts", "file=Human.GRCh38.p13.annot.tsv.gz", sep="&")
+    annot <- data.table::fread(apath, header=T, quote="", stringsAsFactors=F, data.table=F)
+    rownames(annot) <- annot$GeneID
+    sml <- strsplit(gsms, split="")[[1]]
+    sel <- which(sml != "X")
+    sml <- sml[sel]
+    tbl <- tbl[ ,sel]
+    gs <- factor(sml)
+    groups <- make.names(c("Ctrl", "Hypothyroidism")) # change groups to disease state from dataset
+    levels(gs) <- groups
+    sample_info <- data.frame(Group = gs, row.names = colnames(tbl))
+    keep <- rowSums( tbl >= 10 ) >= min(table(gs))
+    tbl <- tbl[keep, ]
+    ds <- DESeqDataSetFromMatrix(countData=tbl, colData=sample_info, design= ~Group)
+    ds <- DESeq(ds, test="Wald", sfType="poscount")
+    r <- results(ds, contrast=c("Group", groups[2], groups[1]), alpha=0.05, pAdjustMethod ="fdr")
+    tT <- r[order(r$padj)[1:length(r$padj)],]
+    tT <- merge(as.data.frame(tT), annot, by=0, sort=F)
+    tT <- subset(tT, select=c("GeneID","padj","pvalue","lfcSE","stat","log2FoldChange","baseMean","Symbol","Description"))
+    #### subset ####
+    ex2 <- data.table(subset(tT, select=c("GeneID", "Symbol", "Description", "log2FoldChange", "pvalue", "padj")))
+    #### Adjust column names ####
+    setnames(ex2, c("GeneID", "Symbol", "Description"), c("ENTREZID", "SYMBOL", "GENENAME"))
+    #### Get Raw data ####
+    GeneID <- as.integer(rownames(exraw))
+    exraw <- as.data.table(exraw)
+    #### Update column names ####
+    exraw$ENTREZID <- GeneID
+    #### merge FC and raw data together ####
+    mer <- merge(ex2, exraw, by = "ENTREZID")
+    return(mer)
+  }
+}
+```
+
+Data chosen: [GSE176153](https://www.ncbi.nlm.nih.gov/geo/geo2r/?acc=GSE176153)
+GEO summary: “Differentially Expressed Mitochondrial Circulating mRNA in Hypothyroidism Could Be Useful as a Survivor Biomarker in Nonthyroidal Illness Syndrome” 
+
+``` {r 2-download, eval=TRUE, echo=TRUE, message=FALSE, warning=FALSE}
+# download data from GEO using GEODataDownload function
+RNAseqData <- GEODataDownload(DS = "GSE176153",
+                              gpl = "GPL17303",
+                              gsm = "00001111",
+                              Technology = "RNAseq")
+```
+
+**Map annotation features to data set**
+
+``` {r 2-annotation, eval=TRUE, echo=TRUE, message=FALSE, warning=FALSE}
+# map annotation information onto RNA seq data
+# load species specfic library - in this case homo sapien
+# if (!require("BiocManager", quietly = TRUE))
+#     install.packages("BiocManager")
+# BiocManager::install("org.Hs.eg.db")
+library(org.Hs.eg.db)
+# annotations to map onto RNA seq data
+cols <- c("UNIPROT", "PFAM","ENSEMBL")
+# create list of keys
+RNA_keys <- as.character(RNAseqData$SYMBOL)
+# select features from org.Hs.eg.db
+anno <- select(org.Hs.eg.db, keys=RNA_keys, columns=cols, keytype="SYMBOL")
+# to ensure no duplication, print dimensions before and after merge
+dims <- paste(dim(RNAseqData), collapse = " x ")
+paste("Dimensions of RNAseqData before merge: ", dims)
+# merge annotations to RNA seq data
+RNAseqData <- merge(RNAseqData,anno[!duplicated(anno$SYMBOL),],by="SYMBOL")
+# print dimensions after merge 
+dims <- paste(dim(RNAseqData), collapse = " x ")
+paste("Dimensions of RNAseqData after merge: ", dims)
+```
+
+*Code explanation:* The above code loads the `org.Hs.eg.db` library. This library is specific to *Homo sapiens* and will be used to map annotation features onto the downloaded `RNAseqData`. In this instance, I selected the `UNIPROT`, `PFAM`, and `ENSEMBL` features to be mapped onto the `RNAseqData`. To ensure there were no duplicate entries, the first row of the annotations was used to map onto `RNAseqData`. This method may not be entirely accurate and would be adapted in future analyses.  
+
+The dimensions of `RNAseqData` before and after the merge show a successful mapping of the three annotation features.
+
+``` {r 2-clean, eval=TRUE, echo=FALSE}
+rm(anno,cols,dims,RNA_keys)
+```
+
+
+**Load downloaded data into a summarized experiment object.**
+
+``` {r 3, eval=TRUE, echo=TRUE, message=FALSE, warning=FALSE}
+library(SummarizedExperiment)
+# using the data set I downloaded, load it into a summarized experiment object
+countMat <- data.matrix(RNAseqData[,7:14])
+rownames(countMat) <- RNAseqData$SYMBOL
+head(countMat)
+# make the row data the annotation information I downloaded above
+# columns 1 through 6 were additional information that came with the original RNA download 
+# columns 15 through 17 came from row annotations in question 2
+RowData <- RNAseqData[,c(1:6,15,16,17)]
+row.names(RowData) <- RNAseqData$SYMBOL
+head(RowData)
+# make the column data the meta data that can be downloaded with the data set
+# used SRA run selector to download experiment metadata 
+ColData <- read.csv("~/GSE176153_Metadata.csv")
+rownames(ColData) <- ColData$GEO_Accession..exp.
+ColData <- ColData[,c("AGE","gender","disease_state","tsh","GEO_Accession..exp.")]
+colnames(ColData) <- c("age", "gender", "disease_state", "tsh", "sample_name")
+head(ColData)
+# create summarized experiment object
+identical(rownames(ColData), colnames(countMat))
+SE <- SummarizedExperiment(assays=list(counts=countMat), rowData = RowData, colData=ColData, )
+# return the rowData, colData, and assay data 
+assays(SE)
+head(assays(SE)[["counts"]])
+head(colData(SE))
+head(rowData(SE))
+```
+
+``` {r 3-clean, eval=TRUE, echo=FALSE}
+rm(ColData, RowData, countMat)
+```
+
+*Code explanation:* The above code created a `summarizedExperiment` object from data of the previous question. A count matrix was extracted from `RNAseqData`. Then, a `RowData` data frame of gene information was constructed using additional information provided from the experiment and the annotation features mapped in the previous question. Next, the `ColData` data frame was created using downloaded metadata from [SRA run selector](https://www.ncbi.nlm.nih.gov/Traces/study/). All these components were used to make a summarizedExperiment object `SE`. The head of each component was then printed as requested.
+
+
+**Column and row wise summary statistics of the data I downloaded.**
+
+``` {r 4-age, eval=TRUE, echo=TRUE, message=FALSE, warning=FALSE, class.source = "fold-show", fig.height=5, fig.width=12, results='show', cache=FALSE}
+library(ggplot2)
+# print out column summary statistics 
+# quantitative variables - age and tsh
+summary(colData(SE)$age)
+ggplot(colData(SE), aes(x=age, color = gender)) + geom_histogram(binwidth = 5, fill="white") + 
+  labs(title = "Participant Age Count", x = "Age", y = "Count") + theme_bw() + theme(plot.title = element_text(hjust = 0.5))
+```
+
+*Code explanation:* For column summary statistics, I started with the quantitative variables age and thyroid stimulating hormone (TSH). We see that there are 8 participants with a mean age of 39. Since this experiment seeks to define the differences in mitochondrial mRNA between healthy controls and participants with hypothyroidism, TSH was a measurement that was collected. 
+
+``` {r 4-tsh, eval=TRUE, echo=TRUE, message=FALSE, warning=FALSE, class.source = "fold-show", fig.height=5, fig.width=12, results='show', cache=FALSE}
+# thyroid stimulating hormone
+summary(colData(SE)$tsh) 
+# how does thyroid stimulating hormone compare between groups? 
+mean(SE$tsh[colData(SE)$disease_state == "control"])
+mean(SE$tsh[colData(SE)$disease_state == "hypothyroidism"])
+SE$disease_state <- as.factor(SE$disease_state)
+ggplot(colData(SE), aes(x = disease_state, y=tsh)) + geom_boxplot() + geom_jitter(shape=16, position=position_jitter(0.2)) +
+  labs(title = "Levels of Thyroid Stimulating Hormone (TSH)", x = "Disease State", y = "TSH Level") + theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+*Code explanation:* Above, I investigate the differences in TSH between control and participants with hypothyroidism. The boxplot and the mean TSH levels calculated show a drastic difference in TSH between these two groups. There are much higher levels of TSH in those with hypothyroidism. 
+
+``` {r 4-categorical, eval=TRUE, echo=TRUE, message=FALSE, warning=FALSE, class.source = "fold-show", fig.height=5, fig.width=12, results='show', cache=FALSE}
+# count of categorical variables
+table(colData(SE)$gender)
+table(colData(SE)$disease_state)
+```
+
+*Code explanation:* Besides the quantitative variables in the column data, there are also categorical labels. The code above generates count tables of gender and disease state between the 8 participants. We see there are 2 more females than males and half of the participants have hypothyroidism. 
+
+``` {r 4-row, eval=TRUE, echo=TRUE, message=FALSE, warning=FALSE, class.source = "fold-show", fig.height=5, fig.width=12, results='show', cache=FALSE}
+# print out row summary statistics 
+# histogram of adjusted p-values 
+hist(rowData(SE)$padj, breaks=seq(0, 1, length = 21), col = "grey", border = "white", 
+         xlab = "", ylab = "", main = "GSE176153 Frequencies of padj-values")
+# print out top differentially expressed genes 
+rowData(SE) <- rowData(SE)[order(rowData(SE)$padj, decreasing = FALSE), ]
+top_DEG_genes <- paste(rowData(SE)$SYMBOL[1:5], collapse = ", ")
+paste("Top 5 Differentially Expressed Genes by Increasing Adjusted p-value: ", top_DEG_genes)
+head(rowData(SE),5)
+
+# volcano plot 
+ggplot(data = rowData(SE), aes(x = log2FoldChange, y = -log10(pvalue))) +
+  geom_point() + labs(title = "Control versus Hypothyroidism") + 
+  geom_vline(xintercept = c(-0.6, 0.6), col = "gray", linetype = 'dashed') +
+  geom_hline(yintercept = -log10(0.05), col = "gray", linetype = 'dashed') +
+  theme_bw() + theme(plot.title = element_text(hjust = 0.5))
+
+# HLA-DRB1 box plot 
+HLA_df = as.data.frame(assay(SE)["HLA-DRB1",])
+HLA_df = cbind(HLA_df, SE$disease_state)
+colnames(HLA_df) <- c("HLA","disease_state")
+ggplot(HLA_df, aes(x = disease_state, y = HLA)) + geom_boxplot() + geom_jitter(shape=16, position=position_jitter(0.2)) + 
+  labs(title = "Expression of HLA-DRB1 Between Disease States", x = "Disease State", y = "Expression of HLA-DRB1") + 
+  theme_bw() + theme(plot.title = element_text(hjust = 0.5))
+```
+
+*Code explanation:* Next, row summary statistics were conducted. A histogram of adjusted p-values show the expression of only one gene, HLA-DRB1, is considered significant (<5%). The row data were reordered by increasing adjusted p-value and the top 5 genes were printed. A volcano plot shows the log fold change on the x-axis and the p-value on the y-axis. Lastly, the expression of HLA-DRB1 was displayed on a boxplot, separated by disease state. From these data, we can conclude that this experiment found the expression of HLA-DRB1 to be significantly upregulated in the mitochondrial mRNA of those with hypothyroidism. This gene is a part of the major histocompatibility complex in the class II beta chain paralogs. Previous genome wide association [studies](https://www.genecards.org/cgi-bin/carddisp.pl?gene=HLA-DRB1) confirms this gene's involvement in hypothyroidism. 
+
+  
