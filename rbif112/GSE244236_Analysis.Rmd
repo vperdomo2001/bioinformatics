@@ -1,0 +1,223 @@
+---
+title: Week 2 - Homework 2
+author: "Author: Veronica Perdomo"
+date: "Last update: `r format(Sys.time(), '%d %B, %Y')`" 
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 4
+    fig_caption: yes
+    code_folding: hide
+    number_sections: true
+  pdf_document:
+    toc: true
+vignette: >
+    %\VignetteIndexEntry{Text}
+    %\usepackage[utf8]{inputenc}
+    %\VignetteEngine{knitr::rmarkdown}
+fontsize: 15pt
+editor_options: 
+  chunk_output_type: console
+---
+
+<style>
+pre code, pre, code {
+  white-space: pre !important;
+  overflow-x: auto !important;
+  word-break: keep-all !important;
+  word-wrap: initial !important;
+}
+body {
+text-align: justify}
+</style>
+
+
+```{r setup, eval=TRUE, echo=FALSE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+setwd("~/HW/HW 2")
+library(ggplot2)
+library(tidyverse)
+```
+
+**Downloaded RNAseq data using function below**
+
+```{r geo-download-fn, eval=TRUE, echo=TRUE, message=FALSE, warning=FALSE}
+# import GEODataDownload function from notes 
+GEODataDownload <- function(DS, gpl, gsm, PlateAnnotInfo, GenerateMetaData, Technology){
+  library(DESeq2); library(limma); library(data.table)
+  if(Technology == "Array"){
+    gset <- getGEO(DS)
+    if(length(gset) > 1) idx <- grep(gpl, attr(gset, "names")) else idx <- 1
+    gset <- gset[[idx]]
+    fvarLabels(gset) <- make.names(fvarLabels(gset))
+    comp <- gsub(" ", "", gsm)
+    comp <- gsub(",", "", comp)
+    gsms <- paste0(comp)
+    #### Set up raw names ####
+    sml <- c()
+    for(i in 1:nchar(gsms)){ sml[i] <- substr(gsms,i,i)}
+    ex <- exprs(gset)
+    qx <- as.numeric(quantile(ex, c(0., 0.25, 0.5, 0.75, 0.99, 1.0), na.rm=T))
+    LogC <- (qx[5] > 100) ||
+      (qx[6]-qx[1] > 50 && qx[2] > 0) ||
+      (qx[2] > 0 && qx[2] < 1 && qx[4] < 2)
+    if(LogC){ ex[which(ex <= 0)] <- NaN
+    exprs(gset) <- log2(ex) }
+    sml <- paste("G", sml, sep="")
+    f1 <- as.factor(sml)
+    gset$description2 <- f1
+    design <- model.matrix(~description2 + 0, gset)
+    colnames(design) <- levels(f1)
+    fit <- lmFit(gset, design)
+    cont.matrix <- makeContrasts(G1-G0, levels = design)
+    fit2 <- contrasts.fit(fit, cont.matrix)
+    fit2 <- eBayes(fit2, 0.01)
+    tT <- topTable(fit2, adjust="fdr", sort.by = "B", number = 25000000000)
+    #### subset ####
+    ex2 <- data.table(subset(tT, select=c("ID", "logFC", "P.Value", "adj.P.Val")))
+    ex2$ID <- as.character(ex2$ID)
+    #### annotate with gene names ####
+    plat <- PlateAnnotInfo[GPLID == gpl,][,!"GPLID", with = FALSE]
+    if(nrow(plat) == 0){ print(paste("There is no annotation information available for", gpl)) }
+    plat$ID <- as.character(plat$ID)
+    plat <- plat[!duplicated(plat$ID),]
+    ex2 <- merge(plat, ex2, by = "ID")
+    ex2$ID <- as.character(ex2$ID)
+    exraw <- data.table(ex)
+    exraw$ID <- as.character(rownames(ex))
+    #### annotate raw data with gene names ####
+    ex2 <- merge(ex2, exraw, by = "ID")
+    #### Generate Meta Data ####
+    Pdat <- pData(gset)
+    #### Add Meta data ####
+    Pdat <- as.data.table(Pdat)
+    return(list(Data = ex2, MetaData = Pdat))
+  }
+  
+  if(Technology == "RNAseq"){
+    ACC <- paste("acc=", DS, sep = "")
+    file <- paste("file=", DS, "_raw_counts_GRCh38.p13_NCBI.tsv.gz", sep = "")
+    comp <- gsub(" ", "", gsm)
+    comp <- gsub(",", "", comp)
+    gsms <- paste0(comp)
+    #### Set up DEG names ####
+    urld <- "https://www.ncbi.nlm.nih.gov/geo/download/?format=file&type=rnaseq_counts"
+    path <- paste(urld, ACC, file, sep="&");
+    tbl <- as.matrix(data.table::fread(path, header=T, colClasses="integer"), rownames="GeneID")
+    exraw <- tbl 
+    apath <- paste(urld, "type=rnaseq_counts", "file=Human.GRCh38.p13.annot.tsv.gz", sep="&")
+    annot <- data.table::fread(apath, header=T, quote="", stringsAsFactors=F, data.table=F)
+    rownames(annot) <- annot$GeneID
+    sml <- strsplit(gsms, split="")[[1]]
+    sel <- which(sml != "X")
+    sml <- sml[sel]
+    tbl <- tbl[ ,sel]
+    gs <- factor(sml)
+    groups <- make.names(c("Ctrl", "Trt")) # change groups to disease state from dataset
+    levels(gs) <- groups
+    sample_info <- data.frame(Group = gs, row.names = colnames(tbl))
+    keep <- rowSums( tbl >= 10 ) >= min(table(gs))
+    tbl <- tbl[keep, ]
+    ds <- DESeqDataSetFromMatrix(countData=tbl, colData=sample_info, design= ~Group)
+    ds <- DESeq(ds, test="Wald", sfType="poscount")
+    r <- results(ds, contrast=c("Group", groups[2], groups[1]), alpha=0.05, pAdjustMethod ="fdr")
+    tT <- r[order(r$padj)[1:length(r$padj)],]
+    tT <- merge(as.data.frame(tT), annot, by=0, sort=F)
+    tT <- subset(tT, select=c("GeneID","padj","pvalue","lfcSE","stat","log2FoldChange","baseMean","Symbol","Description"))
+    #### subset ####
+    ex2 <- data.table(subset(tT, select=c("GeneID", "Symbol", "Description", "log2FoldChange", "pvalue", "padj")))
+    #### Adjust column names ####
+    setnames(ex2, c("GeneID", "Symbol", "Description"), c("ENTREZID", "SYMBOL", "GENENAME"))
+    #### Get Raw data ####
+    GeneID <- as.integer(rownames(exraw))
+    exraw <- as.data.table(exraw)
+    #### Update column names ####
+    exraw$ENTREZID <- GeneID
+    #### merge FC and raw data together ####
+    mer <- merge(ex2, exraw, by = "ENTREZID")
+    return(mer)
+  }
+}
+```  
+
+The dataset I explored has the following information: 
+
+GEO Accession: [GSE244236](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE244236)
+
+GEO summary: To investigate implantation and early pregnancy complications related with adenomyosis, this study uses next-generation sequencing and compares the differential gene expression profiles of control endometrial organoids and adenomyosis endometrial organoids, differentiated into mid-secretory and gestational endometrial phase.
+
+```{r 1-data-download, eval=TRUE, echo=TRUE, message=FALSE, warning=FALSE}
+# download data from GEO using GEODataDownload function
+RNAseqData <- GEODataDownload(DS = "GSE244236",
+                              gpl = "GPL21697",
+                              gsm = "01111111111110001000100100000001011001101101110010110",
+                              Technology = "RNAseq")
+```
+
+*Code explanation:* Using the `GEODataDownload` function, I downloaded the RNA-seq data from GSE244236. This experiment compared gene expression between control endometrial organoids and adenomyosis endometrial organoids to better understand complications during pregnancy. 
+
+**DESeq analysis will compare the two classes control vs. adenomyosis.**
+
+```{r 1-se, eval=TRUE, echo=TRUE, message=FALSE, warning=FALSE}
+# make summarized experiment to input into DESeq2
+library(SummarizedExperiment)
+# load count data into a count matrix 
+countMat <- data.matrix(RNAseqData[,7:50])
+rownames(countMat) <- RNAseqData$SYMBOL
+head(countMat[,1:5])
+# row data is gene annotation data 
+RowData <- RNAseqData[,c(1:6)]
+row.names(RowData) <- RNAseqData$SYMBOL
+head(RowData)
+# column data is metadata 
+ColData <- read.csv("~/GSE244236_metadata.csv")
+rownames(ColData) <- ColData$Sample.Name
+ColData <- ColData[,c("Sample.Name","treatment","differentiation_phase")]
+colnames(ColData) <- c("sample_name", "treatment", "differentiation_phase")
+ColData$treatment <- ifelse(ColData$treatment == "None; contraol", "Control", as.character(ColData$treatment))   
+head(ColData)
+# create summarized experiment object
+ColData <- ColData[colnames(countMat),]
+identical(rownames(ColData), colnames(countMat))
+SE <- SummarizedExperiment(assays=list(counts=countMat), rowData = RowData, colData=ColData, )
+```
+
+*Code explanation:* The RNA-seq data was loaded into a summarizedExperiment object. A count matrix was extracted from `RNAseqData`. Then, the `RowData` data frame was constructed using gene statistics information. Next, the `ColData` data frame was created using downloaded metadata from [SRA run selector](https://www.ncbi.nlm.nih.gov/Traces/study/). All these components were used to make a summarizedExperiment object `SE`. In the next code chunk, I will convert the information from the summarizedExperiment object into a DESeq2 object for analysis. 
+
+```{r 1-deseq, eval=TRUE, echo=TRUE, message=FALSE, warning=FALSE}
+# DESeq2 Analysis
+# following DESeq2 vignette 
+library(DESeq2)
+# convert summarized experiment into DESeq2 object 
+# using treatment as the factor 
+dds=DESeqDataSet(SE,design = ~treatment) 
+# filter out low counts
+dds <- dds[rowSums(counts(dds)) >= 10,]
+# relevel treatment to have control as reference
+dds$treatment <- relevel(dds$treatment, ref = "Control")
+# run DESeq2
+dds=DESeq(dds) 
+# store results, modify significance to be 0.05  
+res05 <- results(dds, alpha=0.05)
+summary(res05)
+# print top differentially expressed genes by adjusted p-value
+resOrdered <- res05[order(res05$padj),]
+head(resOrdered)
+top_DEG_genes <- paste(rownames(res05)[1:5], collapse = ", ")
+paste("Top 5 Differentially Expressed Genes by Increasing Adjusted p-value: ", top_DEG_genes)
+# plot MA: shows the log2 fold changes attributable to the treatment over the mean of normalized counts for all the samples
+DESeq2::plotMA(res05, main = "log2 fold change of results using p=0.05 significance") 
+# volcano plot 
+res05$diffexpressed[res05$log2FoldChange > 0.6 & res05$pvalue < 0.05] <- "UP"
+res05$diffexpressed[res05$log2FoldChange < -0.6 & res05$pvalue < 0.05] <- "DOWN"
+ggplot(data = res05, aes(x = log2FoldChange, y = -log10(pvalue), col = diffexpressed)) +
+  geom_point() + labs(title = "Control versus Adenomyosis") +
+  geom_vline(xintercept = c(-0.6, 0.6), col = "gray", linetype = 'dashed') +
+  geom_hline(yintercept = -log10(0.05), col = "gray", linetype = 'dashed') +
+  scale_color_manual(values = c("steelblue", "darkred", "gray"), 
+                     labels = c("Downregulated", "Upregulated","Not significant")) +
+  theme_bw() + theme(plot.title = element_text(hjust = 0.5))
+```
+
+*Code Explanation:* `SE` was converted into a DESeq2 object called `dds`. Low gene counts were removed, and the experiment was releveled to have the control as the reference. DESeq2 was run with a significance threshold of 0.05 and the results were stored in `res05`. In all, there were 2,995 genes that were found to be significantly downregulated and 802 genes that were found to be significantly upregulated, according to adjusted p-value. Of these, the five genes with the lowest adjusted p-values were NAT1, SERPINA3, AAMP, AARS1, and ABAT. An MA plot displays the log fold change by mean of normalized counts. Lastly, a volcano plot displays the p-value by log2 fold change.
